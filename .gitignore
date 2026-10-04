@@ -1,0 +1,11 @@
+# Build output
+build/
+nul
+
+# Build logs
+build_log*.txt
+
+# IDE
+.vs/
+.vscode/
+.idea/
