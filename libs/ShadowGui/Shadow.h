@@ -690,6 +690,22 @@ namespace Shadow {
 
         float TextShadowOffsetX = 1.0f;
         float TextShadowOffsetY = 1.0f;
+
+        // ---- 圆角 (0 = 直角, 与旧版完全一致; >= ShadowRoundingMax 视作胶囊/pill) ----
+        float WindowRounding    = 0.f;   // 窗口整体
+        float FrameRounding     = 0.f;   // 输入框 / 下拉框 / 列表 / 进度条底
+        float ButtonRounding    = 0.f;   // 按钮
+        float SwitchRounding    = 0.f;   // 开关轨道与滑块
+        float SliderRounding    = 0.f;   // 滑块轨道 / 填充 / 手柄
+        float ScrollbarRounding = 0.f;   // 滚动条轨道 / 滑块
+        float PopupRounding     = 0.f;   // 弹出层 / 提示框
+        float TabRounding       = 0.f;   // 标签页
+        float ItemRounding      = 0.f;   // 下拉项 / 菜单项 / Selectable
+        float SmallRounding     = 0.f;   // 复选框等小控件
+        float FrameBorderThickness = 0.f; // 输入框/下拉框描边粗细 (0 = 不描边)
+        float ButtonBorderThickness = 0.f; // 按钮描边粗细 (0 = 不描边)
+        bool  ButtonTextCenter = false;    // 按钮文本水平居中
+        float SliderKnobRingThickness = 0.f; // 滑块圆形手柄描边 (0 = 不描边)
     };
 
     struct TabDisplayInfo {
@@ -720,8 +736,12 @@ namespace Shadow {
         Text,
         TriangleFilled,
         Triangle,
-        Texture
+        Texture,
+        RectFilledGradient   // 圆角线性渐变填充 (color -> color2)
     };
+
+    // 圆角上限: 超过此值按 pill (半高/半宽) 处理
+    constexpr float ShadowRoundingMax = 999.f;
 
     struct ShadowDrawCmd {
         ShadowDrawCmdType type;
@@ -741,6 +761,11 @@ namespace Shadow {
         bool textOutline;
         bool noSDF;
         SDK::UTexture* texture = nullptr;
+
+        // --- 圆角/渐变扩展 (默认 0/关闭 时行为与旧版完全一致) ---
+        float rounding = 0.f;            // 圆角半径; >= ShadowRoundingMax 视作 pill
+        Color color2 = { 0.f, 0.f, 0.f, 0.f }; // 渐变终点色
+        bool  verticalGradient = false;  // 渐变方向: false=水平, true=垂直
     };
 
     struct ShadowDrawList {
@@ -783,6 +808,14 @@ namespace Shadow {
         void AddRect(Vec2 pos, Vec2 size, Color color, float thickness = 1.0f);
         void AddRectFilled(Vec2 pos, Vec2 size, Color color);
         void AddCircleFilled(Vec2 center, float radius, Color color);
+
+        // --- 圆角/渐变扩展 API ---
+        // 圆角实心矩形 (rounding >= ShadowRoundingMax 视作胶囊/pill)
+        void AddRectFilledRounded(Vec2 pos, Vec2 size, float rounding, Color color);
+        // 圆角描边矩形
+        void AddRectRounded(Vec2 pos, Vec2 size, float rounding, Color color, float thickness = 1.0f);
+        // 圆角线性渐变填充 (horizontal: color -> color2)
+        void AddRectFilledGradientRounded(Vec2 pos, Vec2 size, float rounding, Color color, Color color2, bool vertical = false);
         void AddTexture(Vec2 pos, Vec2 size, Color color, SDK::UTexture* texture = nullptr);
         void AddTriangle(Vec2 p1, Vec2 p2, Vec2 p3, Color color, float thickness = 1.0f);
         void AddTriangleFilled(Vec2 p1, Vec2 p2, Vec2 p3, Color color);
@@ -885,6 +918,9 @@ namespace Shadow {
 
         double RealTimeSeconds = 0.0;
         double DeltaTime = 0.0;
+
+        // 开关滑块动画进度: 控件 id -> 0(关)..1(开)。键集合由实际控件决定, 有界。
+        std::unordered_map<size_t, float> SwitchAnim;
 
         Vec2 MousePos = { 0.f, 0.f };
         bool MouseDown = false;
@@ -2201,6 +2237,127 @@ namespace Shadow {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // 圆角绘制: 用"中间实心 + 上下圆角带逐行扫描"合成, 不依赖任何额外纹理。
+    // rounding <= 0 时退化为普通矩形, 与旧行为完全一致。
+    // -----------------------------------------------------------------------
+    namespace Detail {
+        inline float ResolveRounding(float rounding, Vec2 size) {
+            if (rounding <= 0.5f) return 0.f;
+            return std::min(rounding, std::min(size.x, size.y) * 0.5f);
+        }
+        // 给定到圆心的垂直距离, 返回该行的x内缩量
+        inline float CornerInset(float r, float dist) {
+            if (dist <= 0.f) return 0.f;
+            if (dist >= r) return r;
+            return r - std::sqrt(std::max(0.f, r * r - dist * dist));
+        }
+    }
+
+    inline void InternalDrawRectFilledRounded(Vec2 pos, Vec2 size, float rounding, Color color,
+                                              bool clipEnabled, Vec2 clipMin, Vec2 clipMax, SDK::UTexture* texture = nullptr) {
+        if (size.x <= 0.f || size.y <= 0.f) return;
+        const float r = Detail::ResolveRounding(rounding, size);
+        if (r <= 0.f) {
+            InternalDrawRectFilled(pos, size, color, clipEnabled, clipMin, clipMax, texture);
+            return;
+        }
+
+        // 中段 (不含圆角带)
+        const float midH = size.y - r * 2.f;
+        if (midH > 0.f)
+            InternalDrawRectFilled({ pos.x, pos.y + r }, { size.x, midH }, color, clipEnabled, clipMin, clipMax, texture);
+
+        // 上下圆角带: 逐行扫描。
+        // 注意 rows = ceil(r), 中段只覆盖到 size.y - r, 所以底部必须画满 rows 行
+        // (从 size.y - rows 起), 不能只画 rows-1 行 —— 否则 y = size.y - r 那一行
+        // 没人填, 卡片上就会出现一条 1px 的透明缝 (露出底色, 看着像一条白横线)。
+        const int rows = static_cast<int>(std::ceil(r));
+        for (int i = 0; i < rows; ++i) {
+            const float inset = Detail::CornerInset(r, r - (static_cast<float>(i) + 0.5f));
+            const float w = size.x - inset * 2.f;
+            if (w <= 0.f) continue;
+            const float yTop = pos.y + static_cast<float>(i);
+            const float yBottom = pos.y + size.y - 1.f - static_cast<float>(i);
+            InternalDrawRectFilled({ pos.x + inset, yTop }, { w, 1.f }, color, clipEnabled, clipMin, clipMax, texture);
+            InternalDrawRectFilled({ pos.x + inset, yBottom }, { w, 1.f }, color, clipEnabled, clipMin, clipMax, texture);
+        }
+    }
+
+    inline void InternalDrawRectFilledGradientRounded(Vec2 pos, Vec2 size, float rounding,
+                                                      Color c1, Color c2, bool vertical,
+                                                      bool clipEnabled, Vec2 clipMin, Vec2 clipMax, SDK::UTexture* texture = nullptr) {
+        if (size.x <= 0.f || size.y <= 0.f) return;
+        const float r = Detail::ResolveRounding(rounding, size);
+
+        auto lerp = [&](float t) -> Color {
+            return { c1.r + (c2.r - c1.r) * t, c1.g + (c2.g - c1.g) * t,
+                     c1.b + (c2.b - c1.b) * t, c1.a + (c2.a - c1.a) * t };
+        };
+
+        constexpr float kStep = 2.f; // 2px 步进, 兼顾平滑与指令数量
+        if (!vertical) {
+            for (float x = 0.f; x < size.x; x += kStep) {
+                const float w = std::min(kStep, size.x - x);
+                const float t = size.x > kStep ? (x + w * 0.5f) / size.x : 0.f;
+                float inset = 0.f;
+                if (r > 0.f) {
+                    if (x < r) inset = Detail::CornerInset(r, r - (x + w * 0.5f));
+                    else if (x + w > size.x - r) inset = Detail::CornerInset(r, (x + w * 0.5f) - (size.x - r));
+                }
+                const float h = size.y - inset * 2.f;
+                if (h <= 0.f) continue;
+                InternalDrawRectFilled({ pos.x + x, pos.y + inset }, { w, h }, lerp(t), clipEnabled, clipMin, clipMax, texture);
+            }
+        }
+        else {
+            for (float y = 0.f; y < size.y; y += kStep) {
+                const float h = std::min(kStep, size.y - y);
+                const float t = size.y > kStep ? (y + h * 0.5f) / size.y : 0.f;
+                float inset = 0.f;
+                if (r > 0.f) {
+                    if (y < r) inset = Detail::CornerInset(r, r - (y + h * 0.5f));
+                    else if (y + h > size.y - r) inset = Detail::CornerInset(r, (y + h * 0.5f) - (size.y - r));
+                }
+                const float w = size.x - inset * 2.f;
+                if (w <= 0.f) continue;
+                InternalDrawRectFilled({ pos.x + inset, pos.y + y }, { w, h }, lerp(t), clipEnabled, clipMin, clipMax, texture);
+            }
+        }
+    }
+
+    inline void InternalDrawRectRounded(Vec2 pos, Vec2 size, float rounding, Color color, float thickness,
+                                        bool clipEnabled, Vec2 clipMin, Vec2 clipMax, SDK::UTexture* texture = nullptr) {
+        if (size.x <= 0.f || size.y <= 0.f) return;
+        const float r = Detail::ResolveRounding(rounding, size);
+        if (r <= 0.f) {
+            InternalDrawRect(pos, size, color, thickness, clipEnabled, clipMin, clipMax, texture);
+            return;
+        }
+
+        const float x0 = pos.x, y0 = pos.y, x1 = pos.x + size.x, y1 = pos.y + size.y;
+        InternalDrawLine({ x0 + r, y0 }, { x1 - r, y0 }, color, thickness, clipEnabled, clipMin, clipMax, texture);
+        InternalDrawLine({ x0 + r, y1 }, { x1 - r, y1 }, color, thickness, clipEnabled, clipMin, clipMax, texture);
+        InternalDrawLine({ x0, y0 + r }, { x0, y1 - r }, color, thickness, clipEnabled, clipMin, clipMax, texture);
+        InternalDrawLine({ x1, y0 + r }, { x1, y1 - r }, color, thickness, clipEnabled, clipMin, clipMax, texture);
+
+        constexpr int kSeg = 6;
+        auto arc = [&](Vec2 c, float a0, float a1) {
+            Vec2 prev{ c.x + r * std::cos(a0), c.y + r * std::sin(a0) };
+            for (int i = 1; i <= kSeg; ++i) {
+                const float a = a0 + (a1 - a0) * static_cast<float>(i) / kSeg;
+                Vec2 cur{ c.x + r * std::cos(a), c.y + r * std::sin(a) };
+                InternalDrawLine(prev, cur, color, thickness, clipEnabled, clipMin, clipMax, texture);
+                prev = cur;
+            }
+        };
+        constexpr float kPi = 3.14159265358979323846f;
+        arc({ x0 + r, y0 + r }, kPi, kPi * 1.5f);        // 左上
+        arc({ x1 - r, y0 + r }, kPi * 1.5f, kPi * 2.f);  // 右上
+        arc({ x1 - r, y1 - r }, 0.f, kPi * 0.5f);        // 右下
+        arc({ x0 + r, y1 - r }, kPi * 0.5f, kPi);        // 左下
+    }
+
     inline void InternalDrawText(const std::string& text, Vec2 pos, Color color, SDK::UFont* font, float fontScale, Color textShadowColor, Color textOutlineColor, bool textOutline, bool noSDF = false) {
         if (!g_Ctx.Canvas || !font) return;
 
@@ -2717,6 +2874,25 @@ namespace Shadow {
         GetCmdBuffer().push_back({ ShadowDrawCmdType::RectFilled, pos, size, color, 1.0f, "", nullptr, 1.0f, g_Ctx.ClippingEnabled, g_Ctx.ClipMin, g_Ctx.ClipMax, {0,0}, {0,0}, {0,0}, {0,0,0,0}, {0,0,0,0}, false, false, !g_Ctx.TextureStack.empty() ? g_Ctx.TextureStack.back() : nullptr });
     }
 
+    inline void ShadowDrawList::AddRectFilledRounded(Vec2 pos, Vec2 size, float rounding, Color color) {
+        AddRectFilled(pos, size, color);
+        GetCmdBuffer().back().rounding = rounding;
+    }
+
+    inline void ShadowDrawList::AddRectRounded(Vec2 pos, Vec2 size, float rounding, Color color, float thickness) {
+        AddRect(pos, size, color, thickness);
+        GetCmdBuffer().back().rounding = rounding;
+    }
+
+    inline void ShadowDrawList::AddRectFilledGradientRounded(Vec2 pos, Vec2 size, float rounding, Color color, Color color2, bool vertical) {
+        AddRectFilled(pos, size, color);
+        auto& cmd = GetCmdBuffer().back();
+        cmd.type = ShadowDrawCmdType::RectFilledGradient;
+        cmd.rounding = rounding;
+        cmd.color2 = color2;
+        cmd.verticalGradient = vertical;
+    }
+
     inline void ShadowDrawList::AddTexture(Vec2 pos, Vec2 size, Color color, SDK::UTexture* texture) {
         SDK::UTexture* tex = texture ? texture : (!g_Ctx.TextureStack.empty() ? g_Ctx.TextureStack.back() : nullptr);
         GetCmdBuffer().push_back({ ShadowDrawCmdType::Texture, pos, size, color, 1.0f, "", nullptr, 1.0f, g_Ctx.ClippingEnabled, g_Ctx.ClipMin, g_Ctx.ClipMax, {0,0}, {0,0}, {0,0}, {0,0,0,0}, {0,0,0,0}, false, false, tex });
@@ -3118,9 +3294,9 @@ namespace Shadow {
 
         ShadowDrawList* drawList = GetWindowDrawList();
         g_Ctx.PopupStack.back().BgBorderCmdIdx = drawList->GetCmdBuffer().size();
-        drawList->AddRect(g_Ctx.WindowPos, g_Ctx.WindowSize, GetColor(GuiCol_PopupBorder));
+        drawList->AddRectRounded(g_Ctx.WindowPos, g_Ctx.WindowSize, g_Ctx.Style.PopupRounding, GetColor(GuiCol_PopupBorder));
         g_Ctx.PopupStack.back().BgFilledCmdIdx = drawList->GetCmdBuffer().size();
-        drawList->AddRectFilled({ g_Ctx.WindowPos.x + g_Ctx.Style.PopupBorderInset, g_Ctx.WindowPos.y + g_Ctx.Style.PopupBorderInset }, { g_Ctx.WindowSize.x - g_Ctx.Style.PopupFillInset, g_Ctx.WindowSize.y - g_Ctx.Style.PopupFillInset }, GetColor(GuiCol_PopupBg));
+        drawList->AddRectFilledRounded({ g_Ctx.WindowPos.x + g_Ctx.Style.PopupBorderInset, g_Ctx.WindowPos.y + g_Ctx.Style.PopupBorderInset }, { g_Ctx.WindowSize.x - g_Ctx.Style.PopupFillInset, g_Ctx.WindowSize.y - g_Ctx.Style.PopupFillInset }, g_Ctx.Style.PopupRounding, GetColor(GuiCol_PopupBg));
 
         g_Ctx.IndentX = 0.f;
         g_Ctx.Cursor = { g_Ctx.WindowPos.x + g_Ctx.Style.WindowPadding.x, g_Ctx.WindowPos.y + g_Ctx.Style.WindowPadding.y };
@@ -3520,8 +3696,8 @@ namespace Shadow {
         g_Ctx.ListBoxStateStack.push_back(backup);
         g_Ctx.IndentX = 0.f;
 
-        GetWindowDrawList()->AddRectFilled(boxPos, { boxWidth, boxHeight }, GetColor(GuiCol_FrameBg));
-        GetWindowDrawList()->AddRect(boxPos, { boxWidth, boxHeight }, GetColor(GuiCol_Border));
+        GetWindowDrawList()->AddRectFilledRounded(boxPos, { boxWidth, boxHeight }, g_Ctx.Style.FrameRounding, GetColor(GuiCol_FrameBg));
+        GetWindowDrawList()->AddRectRounded(boxPos, { boxWidth, boxHeight }, g_Ctx.Style.FrameRounding, GetColor(GuiCol_Border));
 
         g_Ctx.WindowPos = boxPos;
         g_Ctx.WindowSize = { boxWidth, boxHeight };
@@ -3590,7 +3766,7 @@ namespace Shadow {
             Vec2 trackPos = { backup.Pos.x + backup.Size.x - scrollbarWidth - scrollbarMarginRight, backup.Pos.y };
             Vec2 trackSize = { scrollbarWidth, viewHeight };
 
-            GetWindowDrawList()->AddRectFilled(trackPos, trackSize, GetColor(GuiCol_FrameBg));
+            GetWindowDrawList()->AddRectFilledRounded(trackPos, trackSize, g_Ctx.Style.ScrollbarRounding, GetColor(GuiCol_FrameBg));
 
             float thumbHeight = std::max(g_Ctx.Style.ScrollbarThumbMinSize, (viewHeight / contentHeight) * trackSize.y);
             float thumbY = trackPos.y + (maxScroll > 0.f ? (scrollY / maxScroll) * (trackSize.y - thumbHeight) : 0.f);
@@ -3626,7 +3802,7 @@ namespace Shadow {
             Color thumbColor = (g_Ctx.DraggingListBoxScrollId == backup.Id)
                 ? GetColor(GuiCol_SliderGrab)
                 : (hoveringThumb ? GetColor(GuiCol_FrameBgHovered) : GetColor(GuiCol_Border));
-            GetWindowDrawList()->AddRectFilled(thumbPos, thumbSize, thumbColor);
+            GetWindowDrawList()->AddRectFilledRounded(thumbPos, thumbSize, g_Ctx.Style.ScrollbarRounding, thumbColor);
         }
         else {
             if (g_Ctx.DraggingListBoxScrollId == backup.Id) {
@@ -3820,7 +3996,9 @@ namespace Shadow {
         }
 
         Color bgColor = disabled ? GetColor(GuiCol_ControlDisabled) : (isActive ? GetColor(GuiCol_FrameBgHovered) : (hovered ? GetColor(GuiCol_FrameBgHovered) : GetColor(GuiCol_FrameBg)));
-        GetWindowDrawList()->AddRectFilled(pos, size, bgColor);
+        GetWindowDrawList()->AddRectFilledRounded(pos, size, g_Ctx.Style.FrameRounding, bgColor);
+        if (g_Ctx.Style.FrameBorderThickness > 0.f)
+            GetWindowDrawList()->AddRectRounded(pos, size, g_Ctx.Style.FrameRounding, GetColor(GuiCol_Border), g_Ctx.Style.FrameBorderThickness);
 
         PushClipRect(pos, { pos.x + size.x, pos.y + size.y });
 
@@ -4769,7 +4947,7 @@ namespace Shadow {
             if (!g_Ctx.MouseDown) g_Ctx.IsResizing = false;
         }
 
-        GetWindowDrawList()->AddRectFilled(g_Ctx.WindowPos, g_Ctx.WindowSize, GetColor(GuiCol_WindowBg));
+        GetWindowDrawList()->AddRectFilledRounded(g_Ctx.WindowPos, g_Ctx.WindowSize, g_Ctx.Style.WindowRounding, GetColor(GuiCol_WindowBg));
 
         // 压入主窗口外框物理剪裁区域
         PushClipRect(
@@ -4842,8 +5020,8 @@ namespace Shadow {
         if (bgSize.x < g_Ctx.Style.WindowScrollMinViewHeight) bgSize.x = g_Ctx.Style.TooltipMinSize;
         if (bgSize.y < g_Ctx.Style.WindowScrollMinViewHeight) bgSize.y = g_Ctx.Style.TooltipMinSize;
 
-        GetWindowDrawList()->AddRect({ g_Ctx.WindowPos.x - g_Ctx.Style.PopupBorderInset, g_Ctx.WindowPos.y - g_Ctx.Style.PopupBorderInset }, { bgSize.x + g_Ctx.Style.PopupFillInset, bgSize.y + g_Ctx.Style.PopupFillInset }, GetColor(GuiCol_PopupBorder));
-        GetWindowDrawList()->AddRectFilled(g_Ctx.WindowPos, bgSize, GetColor(GuiCol_PopupBg));
+        GetWindowDrawList()->AddRectRounded({ g_Ctx.WindowPos.x - g_Ctx.Style.PopupBorderInset, g_Ctx.WindowPos.y - g_Ctx.Style.PopupBorderInset }, { bgSize.x + g_Ctx.Style.PopupFillInset, bgSize.y + g_Ctx.Style.PopupFillInset }, g_Ctx.Style.PopupRounding, GetColor(GuiCol_PopupBorder));
+        GetWindowDrawList()->AddRectFilledRounded(g_Ctx.WindowPos, bgSize, g_Ctx.Style.PopupRounding, GetColor(GuiCol_PopupBg));
 
         g_Ctx.WindowSize = bgSize;
         g_Ctx.IndentX = 0.f;
@@ -4909,7 +5087,7 @@ namespace Shadow {
             Vec2 trackPos = { g_Ctx.WindowPos.x + g_Ctx.WindowSize.x - scrollbarWidth - scrollbarMarginRight, g_Ctx.ContentStartY };
             Vec2 trackSize = { scrollbarWidth, viewHeight };
 
-            GetWindowDrawList()->AddRectFilled(trackPos, trackSize, GetColor(GuiCol_FrameBg));
+            GetWindowDrawList()->AddRectFilledRounded(trackPos, trackSize, g_Ctx.Style.ScrollbarRounding, GetColor(GuiCol_FrameBg));
 
             float thumbHeight = std::max(g_Ctx.Style.ScrollbarThumbMinSize, (viewHeight / g_Ctx.ContentHeight) * trackSize.y);
             float thumbY = trackPos.y + (g_Ctx.ScrollY / maxScroll) * (trackSize.y - thumbHeight);
@@ -4918,7 +5096,7 @@ namespace Shadow {
 
             bool hoveringThumb = IsMouseHoveringRaw(thumbPos, thumbSize);
             Color thumbColor = g_Ctx.IsDraggingScrollbar ? GetColor(GuiCol_SliderGrab) : (hoveringThumb ? GetColor(GuiCol_FrameBgHovered) : GetColor(GuiCol_Border));
-            GetWindowDrawList()->AddRectFilled(thumbPos, thumbSize, thumbColor);
+            GetWindowDrawList()->AddRectFilledRounded(thumbPos, thumbSize, g_Ctx.Style.ScrollbarRounding, thumbColor);
         }
 
         if (!noResize) {
@@ -5121,7 +5299,7 @@ namespace Shadow {
                     }
 
                     PushClipRect(clipMin, clipMax);
-                    GetWindowDrawList()->AddRectFilled(tabInfo.pos, tabInfo.size, bgColor);
+                    GetWindowDrawList()->AddRectFilledRounded(tabInfo.pos, tabInfo.size, g_Ctx.Style.TabRounding, bgColor);
                     GetWindowDrawList()->AddText({ tabInfo.pos.x + g_Ctx.Style.TabExtraWidth / 2.f, tabInfo.pos.y + g_Ctx.Style.FramePadding.y }, textColor, tabInfo.display);
                     PopClipRect();
 
@@ -5137,7 +5315,7 @@ namespace Shadow {
             Vec2 trackPos = { tabRowPos.x, tabRowPos.y + g_Ctx.ItemHeight + 2.f };
             Vec2 trackSize = { viewWidth, barHeight };
 
-            GetWindowDrawList()->AddRectFilled(trackPos, trackSize, GetColor(GuiCol_FrameBg));
+            GetWindowDrawList()->AddRectFilledRounded(trackPos, trackSize, g_Ctx.Style.ScrollbarRounding, GetColor(GuiCol_FrameBg));
 
             float thumbWidth = std::max(g_Ctx.Style.ScrollbarThumbMinSize, (viewWidth / g_Ctx.TabBarContentWidth) * trackSize.x);
             float thumbX = trackPos.x + (maxScrollX > 0.f ? (scrollX / maxScrollX) * (trackSize.x - thumbWidth) : 0.f);
@@ -5175,7 +5353,7 @@ namespace Shadow {
             Color thumbColor = (g_Ctx.DraggingTabBarScrollId == tabBarId)
                 ? GetColor(GuiCol_SliderGrab)
                 : (hoveringThumb ? GetColor(GuiCol_FrameBgHovered) : GetColor(GuiCol_Border));
-            GetWindowDrawList()->AddRectFilled(thumbPos, thumbSize, thumbColor);
+            GetWindowDrawList()->AddRectFilledRounded(thumbPos, thumbSize, g_Ctx.Style.ScrollbarRounding, thumbColor);
 
             bool hoveringForWheel = hoveringTabRow || hoveringTrack;
 
@@ -5308,7 +5486,7 @@ namespace Shadow {
 
             if (tabVisible) {
                 PushClipRect(clipMin, clipMax);
-                GetWindowDrawList()->AddRectFilled(tabPos, tabSize, bgColor);
+                GetWindowDrawList()->AddRectFilledRounded(tabPos, tabSize, g_Ctx.Style.TabRounding, bgColor);
                 GetWindowDrawList()->AddText({ tabPos.x + g_Ctx.Style.TabExtraWidth / 2.f, tabPos.y + g_Ctx.Style.FramePadding.y }, textColor, display);
                 PopClipRect();
             }
@@ -5350,9 +5528,14 @@ namespace Shadow {
                     InternalDrawLine(cmd.pos, cmd.size, cmd.color, cmd.thickness, cmd.clippingEnabled, cmd.clipMin, cmd.clipMax, cmd.texture);
                     break;
                 case ShadowDrawCmdType::Rect:
-                    InternalDrawRect(cmd.pos, cmd.size, cmd.color, cmd.thickness, cmd.clippingEnabled, cmd.clipMin, cmd.clipMax, cmd.texture);
+                    InternalDrawRectRounded(cmd.pos, cmd.size, cmd.rounding, cmd.color, cmd.thickness, cmd.clippingEnabled, cmd.clipMin, cmd.clipMax, cmd.texture);
                     break;
                 case ShadowDrawCmdType::RectFilled:
+                    InternalDrawRectFilledRounded(cmd.pos, cmd.size, cmd.rounding, cmd.color, cmd.clippingEnabled, cmd.clipMin, cmd.clipMax, cmd.texture);
+                    break;
+                case ShadowDrawCmdType::RectFilledGradient:
+                    InternalDrawRectFilledGradientRounded(cmd.pos, cmd.size, cmd.rounding, cmd.color, cmd.color2, cmd.verticalGradient, cmd.clippingEnabled, cmd.clipMin, cmd.clipMax, cmd.texture);
+                    break;
                 case ShadowDrawCmdType::Texture:
                     InternalDrawRectFilled(cmd.pos, cmd.size, cmd.color, cmd.clippingEnabled, cmd.clipMin, cmd.clipMax, cmd.texture);
                     break;
@@ -5491,7 +5674,9 @@ namespace Shadow {
         }
 
         Color bgColor = disabled ? GetColor(GuiCol_ControlDisabled) : (hovered ? GetColor(GuiCol_FrameBgHovered) : GetColor(GuiCol_FrameBg));
-        GetWindowDrawList()->AddRectFilled(boxPos, boxSize, bgColor);
+        GetWindowDrawList()->AddRectFilledRounded(boxPos, boxSize, g_Ctx.Style.FrameRounding, bgColor);
+        if (g_Ctx.Style.FrameBorderThickness > 0.f)
+            GetWindowDrawList()->AddRectRounded(boxPos, boxSize, g_Ctx.Style.FrameRounding, GetColor(GuiCol_Border), g_Ctx.Style.FrameBorderThickness);
         GetWindowDrawList()->AddText({ boxPos.x + g_Ctx.Style.FramePadding.x, boxPos.y + g_Ctx.Style.FramePadding.y + (itemHeight - g_Ctx.ItemHeight) * 0.5f }, textColor, currentText);
 
         Vec2 triPos = { boxPos.x + boxSize.x - g_Ctx.Style.FramePadding.x - triSize, boxPos.y + boxSize.y / 2.f - triSize / 2.f };
@@ -5512,7 +5697,7 @@ namespace Shadow {
                 bool isCurrentItem = (*current_item == static_cast<int>(i));
 
                 if (itemHovered) {
-                    GetWindowDrawList()->AddRectFilled(itemPos, { boxWidth, g_Ctx.ItemHeight }, GetColor(GuiCol_FrameBgHovered));
+                    GetWindowDrawList()->AddRectFilledRounded(itemPos, { boxWidth, g_Ctx.ItemHeight }, g_Ctx.Style.ItemRounding, GetColor(GuiCol_FrameBgHovered));
                     if (g_Ctx.MouseClicked) {
                         *current_item = static_cast<int>(i);
                         CloseCurrentPopup();
@@ -5521,7 +5706,7 @@ namespace Shadow {
                     }
                 }
                 else if (isCurrentItem) {
-                    GetWindowDrawList()->AddRectFilled(itemPos, { boxWidth, g_Ctx.ItemHeight }, GetColor(GuiCol_DropdownActive));
+                    GetWindowDrawList()->AddRectFilledRounded(itemPos, { boxWidth, g_Ctx.ItemHeight }, g_Ctx.Style.ItemRounding, GetColor(GuiCol_DropdownActive));
                 }
 
                 Color textCol = isCurrentItem ? GetColor(GuiCol_TextHighlight) : GetColor(GuiCol_Text);
@@ -5569,12 +5754,12 @@ namespace Shadow {
         }
 
         Color bgColor = disabled ? GetColor(GuiCol_ControlDisabled) : (hovered ? GetColor(GuiCol_FrameBgHovered) : GetColor(GuiCol_FrameBg));
-        GetWindowDrawList()->AddRectFilled(pos, boxSize, bgColor);
+        GetWindowDrawList()->AddRectFilledRounded(pos, boxSize, g_Ctx.Style.SmallRounding, bgColor);
 
         if (*value) {
             float checkPad = boxSize.x * g_Ctx.Style.CheckboxCheckPaddingRatio;
             Color checkCol = GetColor(GuiCol_CheckMark);
-            GetWindowDrawList()->AddRectFilled({ pos.x + checkPad, pos.y + checkPad }, { boxSize.x - checkPad * 2.f, boxSize.y - checkPad * 2.f }, checkCol);
+            GetWindowDrawList()->AddRectFilledRounded({ pos.x + checkPad, pos.y + checkPad }, { boxSize.x - checkPad * 2.f, boxSize.y - checkPad * 2.f }, g_Ctx.Style.SmallRounding, checkCol);
         }
 
         Color textColor = disabled ? GetColor(GuiCol_TextDisabled) : GetColor(GuiCol_Text);
@@ -5615,25 +5800,38 @@ namespace Shadow {
 
         Vec2 boxPos = { pos.x + textWidth + g_Ctx.Style.LabelSpacing, pos.y };
 
+        // 滑块位移动画: 指数趋近 (帧率无关), 与轨道颜色插值共用同一进度
+        float& anim = g_Ctx.SwitchAnim[id];
+        const float animTarget = *value ? 1.f : 0.f;
+        if (disabled) {
+            anim = animTarget;
+        }
+        else {
+            const float dt = static_cast<float>(g_Ctx.DeltaTime > 0.0 ? g_Ctx.DeltaTime : 0.016);
+            anim += (animTarget - anim) * (1.f - std::exp(-dt / 0.075f));
+            if (std::abs(animTarget - anim) < 0.002f) anim = animTarget;
+        }
+
         Color bgColor;
         if (disabled) {
             bgColor = GetColor(GuiCol_ControlDisabled);
         }
         else {
-            if (*value) {
-                bgColor = hovered ? GetColor(GuiCol_SwitchBgActiveHovered) : GetColor(GuiCol_SwitchBgActive);
-            }
-            else {
-                bgColor = hovered ? GetColor(GuiCol_SwitchBgHovered) : GetColor(GuiCol_SwitchBg);
-            }
+            const Color offCol = GetColor(hovered ? GuiCol_SwitchBgHovered : GuiCol_SwitchBg);
+            const Color onCol  = GetColor(hovered ? GuiCol_SwitchBgActiveHovered : GuiCol_SwitchBgActive);
+            bgColor = { offCol.r + (onCol.r - offCol.r) * anim,
+                        offCol.g + (onCol.g - offCol.g) * anim,
+                        offCol.b + (onCol.b - offCol.b) * anim,
+                        offCol.a + (onCol.a - offCol.a) * anim };
         }
 
-        GetWindowDrawList()->AddRectFilled(boxPos, boxSize, bgColor);
+        GetWindowDrawList()->AddRectFilledRounded(boxPos, boxSize, g_Ctx.Style.SwitchRounding, bgColor);
 
         Color knobColor = GetColor(GuiCol_SwitchKnob);
 
-        float knobX = *value ? (boxPos.x + width - padding - knobSize) : (boxPos.x + padding);
-        GetWindowDrawList()->AddRectFilled({ knobX, boxPos.y + padding }, { knobSize, knobSize }, knobColor);
+        const float knobTravel = width - padding * 2.f - knobSize;
+        const float knobX = boxPos.x + padding + knobTravel * anim;
+        GetWindowDrawList()->AddRectFilledRounded({ knobX, boxPos.y + padding }, { knobSize, knobSize }, g_Ctx.Style.SwitchRounding, knobColor);
 
         return *value;
     }
@@ -5858,8 +6056,14 @@ namespace Shadow {
         Color bgColor = disabled ? GetColor(GuiCol_ControlDisabled) : (hovered ? GetColor(GuiCol_ButtonHovered) : GetColor(GuiCol_Button));
         Color textColor = disabled ? GetColor(GuiCol_TextDisabled) : GetColor(GuiCol_Text);
 
-        GetWindowDrawList()->AddRectFilled(pos, size, bgColor);
-        GetWindowDrawList()->AddText({ pos.x + g_Ctx.Style.FramePadding.x, pos.y + g_Ctx.Style.FramePadding.y + (size.y - g_Ctx.ItemHeight) * 0.5f }, textColor, display);
+        GetWindowDrawList()->AddRectFilledRounded(pos, size, g_Ctx.Style.ButtonRounding, bgColor);
+        if (g_Ctx.Style.ButtonBorderThickness > 0.f && !disabled)
+            GetWindowDrawList()->AddRectRounded(pos, size, g_Ctx.Style.ButtonRounding, GetColor(GuiCol_Border), g_Ctx.Style.ButtonBorderThickness);
+
+        float btnTextX = pos.x + g_Ctx.Style.FramePadding.x;
+        if (g_Ctx.Style.ButtonTextCenter)
+            btnTextX = pos.x + (size.x - MeasureTextSize(display).x) * 0.5f;
+        GetWindowDrawList()->AddText({ btnTextX, pos.y + g_Ctx.Style.FramePadding.y + (size.y - g_Ctx.ItemHeight) * 0.5f }, textColor, display);
 
         return clicked;
     }
@@ -6023,22 +6227,32 @@ namespace Shadow {
         }
 
         Color bgColor = disabled ? GetColor(GuiCol_ControlDisabled) : (hovered ? GetColor(GuiCol_FrameBgHovered) : GetColor(GuiCol_FrameBg));
-        GetWindowDrawList()->AddRectFilled(sliderPos, size, bgColor);
+        GetWindowDrawList()->AddRectFilledRounded(sliderPos, size, g_Ctx.Style.SliderRounding, bgColor);
 
         float fillWidth = std::clamp((*value - min_val) / (max_val - min_val), 0.f, 1.f) * sliderWidth;
         Color grabCol = GetColor(GuiCol_SliderGrab);
-        GetWindowDrawList()->AddRectFilled(sliderPos, { fillWidth, size.y }, grabCol);
+        if (fillWidth > 0.f)
+            GetWindowDrawList()->AddRectFilledRounded(sliderPos, { fillWidth, size.y }, g_Ctx.Style.SliderRounding, grabCol);
 
-        float knobWidth = g_Ctx.Style.SliderKnobWidth;
-        float knobX = sliderPos.x + fillWidth - knobWidth * 0.5f;
-        knobX = std::clamp(knobX, sliderPos.x, sliderPos.x + sliderWidth - knobWidth);
+        // 手柄: 直径 = 轨道高度, 圆心落在填充末端 (SliderRounding 取 pill 时为圆形)
+        float knobDiameter = size.y;
+        float knobCenterX = std::clamp(sliderPos.x + fillWidth,
+                                       sliderPos.x + knobDiameter * 0.5f,
+                                       sliderPos.x + sliderWidth - knobDiameter * 0.5f);
 
         Color knobCol = GetColor(GuiCol_SliderKnob);
-        GetWindowDrawList()->AddRectFilled({ knobX, sliderPos.y }, { knobWidth, size.y }, knobCol);
+        const Vec2 knobPos = { knobCenterX - knobDiameter * 0.5f, sliderPos.y };
+        GetWindowDrawList()->AddRectFilledRounded(knobPos, { knobDiameter, knobDiameter },
+                                                  g_Ctx.Style.SliderRounding, knobCol);
+        // 白色手柄落在浅色轨道上会糊成一片, 描一圈主色才能看清位置
+        if (g_Ctx.Style.SliderKnobRingThickness > 0.f)
+            GetWindowDrawList()->AddRectRounded(knobPos, { knobDiameter, knobDiameter },
+                                                g_Ctx.Style.SliderRounding, grabCol,
+                                                g_Ctx.Style.SliderKnobRingThickness);
 
         if (g_Ctx.FocusedSliderId == id) {
             Color border = GetColor(GuiCol_Border);
-            GetWindowDrawList()->AddRect(sliderPos, size, border, g_Ctx.Style.SliderFocusBorderThickness);
+            GetWindowDrawList()->AddRectRounded(sliderPos, size, g_Ctx.Style.SliderRounding, border, g_Ctx.Style.SliderFocusBorderThickness);
         }
 
         bool changed = InputTextEx(sliderInputId, valBoxPos, valBoxSize, g_Ctx.InputBuffers[sliderInputId], ShadowInputTextFlags_CharsDecimal | ShadowInputTextFlags_AlignCenter);
@@ -6165,7 +6379,7 @@ namespace Shadow {
 
         if (hovered || IsPopupOpen("##ColorPickerPopup")) {
             Color border = GetColor(GuiCol_Border);
-            GetWindowDrawList()->AddRect(boxPos, boxSize, border);
+            GetWindowDrawList()->AddRectRounded(boxPos, boxSize, g_Ctx.Style.SmallRounding, border);
         }
 
         PushStyleVar(GuiStyleVar_WindowPadding, { 0.f, 0.f });
@@ -6378,7 +6592,7 @@ namespace Shadow {
         }
 
         Color bgColor = disabled ? GetColor(GuiCol_ControlDisabled) : (btnHovered ? GetColor(GuiCol_ButtonHovered) : GetColor(GuiCol_Button));
-        GetWindowDrawList()->AddRectFilled(btnPos, btnSize, bgColor);
+        GetWindowDrawList()->AddRectFilledRounded(btnPos, btnSize, g_Ctx.Style.ButtonRounding, bgColor);
         GetWindowDrawList()->AddText({ btnPos.x + g_Ctx.Style.FramePadding.x, btnPos.y + g_Ctx.Style.FramePadding.y + (itemHeight - g_Ctx.ItemHeight) * 0.5f }, textColor, keyName);
 
         return *hotkey != 0 && g_Ctx.KeyStates[*hotkey];
@@ -6471,7 +6685,7 @@ namespace Shadow {
         }
 
         Color bgColor = disabled ? GetColor(GuiCol_ControlDisabled) : (btnHovered ? GetColor(GuiCol_ButtonHovered) : GetColor(GuiCol_Button));
-        GetWindowDrawList()->AddRectFilled(btnPos, btnSize, bgColor);
+        GetWindowDrawList()->AddRectFilledRounded(btnPos, btnSize, g_Ctx.Style.ButtonRounding, bgColor);
         GetWindowDrawList()->AddText({ btnPos.x + g_Ctx.Style.FramePadding.x, btnPos.y + g_Ctx.Style.FramePadding.y + (itemHeight - g_Ctx.ItemHeight) * 0.5f }, textColor, keyName);
 
         PushStyleVar(GuiStyleVar_WindowPadding, { 0.f, 0.f });

@@ -253,7 +253,7 @@ void DrawInventoryEditor() {
         BeginRow();
         RowLabel(e.id);
         const float btnW = 64.f;
-        Shadow::g_Ctx.Cursor.x = RowRight() - btnW - 12.f;
+        Shadow::g_Ctx.Cursor.x = RowRight() - btnW;
         if (Shadow::Button(std::format("修改##{}", i), {btnW, 0.f})) {
             Helper::Try([&] {
                 e.slot->StackCount = s_targetCount;
@@ -359,7 +359,7 @@ void TabItemSpawner() {
         BeginRow();
         RowLabel(e.name);
         const float btnW = 64.f;
-        Shadow::g_Ctx.Cursor.x = RowRight() - btnW - 12.f;
+        Shadow::g_Ctx.Cursor.x = RowRight() - btnW;
         if (Shadow::Button(std::format("选择##{}", e.id), {btnW, 0.f})) {
             selectedItemID = e.id;
             selectedItemName = e.name;
@@ -407,7 +407,7 @@ void TabItemSpawner() {
         BeginRow();
         RowLabel(it.id);
         const float btnW = 56.f;
-        Shadow::g_Ctx.Cursor.x = RowRight() - btnW * 2 - Shadow::GetStyle().ItemSpacing.x - 12.f;
+        Shadow::g_Ctx.Cursor.x = RowRight() - btnW * 2 - Shadow::GetStyle().ItemSpacing.x;
         if (Shadow::Button(std::format("获取##{}", i), {btnW, 0.f})) {
             if (useServerRequest)
                 AddItemToInventoryByName_ToServer(it.id, it.count);

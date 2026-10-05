@@ -32,7 +32,7 @@ bool ListRow(std::string_view label, std::string_view id, bool selected) {
     BeginRow();
     RowLabel(selected ? std::format("▶ {}", label) : std::string(label));
 
-    Shadow::g_Ctx.Cursor.x = RowRight() - kListButtonW - 12.f;
+    Shadow::g_Ctx.Cursor.x = RowRight() - kListButtonW;
     const bool clicked = Shadow::Button(
         std::format("{}##{}", selected ? "已选" : "选择", id), {kListButtonW, 0.f});
     EndRow();
@@ -44,7 +44,7 @@ bool ActionRow(std::string_view label, std::string_view action, std::string_view
     BeginRow();
     RowLabel(label);
 
-    Shadow::g_Ctx.Cursor.x = RowRight() - kListButtonW - 12.f;
+    Shadow::g_Ctx.Cursor.x = RowRight() - kListButtonW;
     const bool clicked = Shadow::Button(std::format("{}##{}", action, id), {kListButtonW, 0.f});
     EndRow();
     return clicked;

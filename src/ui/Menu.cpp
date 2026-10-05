@@ -15,10 +15,22 @@ namespace pal::ui {
 
 namespace {
 
+using namespace theme;
+
 constexpr float kW        = 1180.f;
 constexpr float kH        = 720.f;
 constexpr float kSidebarW = 240.f;
 constexpr float kHeaderH  = 60.f;
+
+constexpr float kWinPad      = 8.f;    // 窗口内边距 (侧栏与内容的外框留白)
+constexpr float kNavTop      = 104.f;  // 首个导航项相对窗口顶部的偏移
+constexpr float kNavH        = 38.f;
+constexpr float kNavGap      = 4.f;
+constexpr float kBtnH        = 36.f;
+constexpr float kBtnPrimaryW = 104.f;
+constexpr float kBtnGhostW   = 80.f;
+constexpr float kBtnGap      = 10.f;
+constexpr float kRightPad    = 22.f;
 
 struct TabDef {
     std::string_view label;
@@ -46,8 +58,51 @@ struct MenuState {
     float scroll = 0.f;   // 内容区滚动偏移 (px)
     float contentHeight = 0.f; // 上一帧内容总高 (用于滚动钳制)
     Shadow::Vec2 winPos{0.f, 0.f}; // 窗口位置 (0,0 = 尚未初始化, 首帧居中)
+    float navIndicatorY = -1.f;    // 侧栏选中胶囊的动画 Y (<0 = 尚未初始化)
+    float contentFade = 0.f;       // 内容区淡入进度 (切页 / 开菜单时 0 -> 1)
 };
 MenuState g_menu;
+
+// 颜色线性插值 (胶囊滑过时让文字颜色平滑过渡)
+Shadow::Color LerpColor(Shadow::Color a, Shadow::Color b, float t) {
+    return { a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
+             a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t };
+}
+
+// 帧率无关的指数趋近: 本帧朝目标推进的比例
+float EaseStep(float dt, float tau) {
+    return 1.f - std::exp(-std::max(0.0001f, dt) / tau);
+}
+
+// 中文 UI 字号需要缩放时安全压栈
+void PushUiFont(float scale) { if (Shadow::DefaultFont) Shadow::PushFont(Shadow::DefaultFont, scale); }
+void PopUiFont() { if (Shadow::DefaultFont) Shadow::PopFont(); }
+
+// 窗口投影 + 外框: 深色主题用纯黑多层扩散, 最后压一道 1.5px 描边 (EVICTED 的窗口边)。
+// 背景层必须在 Begin 之前发射; 显式关闭裁剪, 避免上一帧遗留的裁剪框吃掉投影。
+void DrawWindowShadow(Shadow::Vec2 winPos) {
+    auto* dl = Shadow::GetBackgroundDrawList();
+    for (int i = 6; i >= 1; --i) {
+        const float grow = static_cast<float>(i) * 2.2f;
+        const float alpha = 0.34f * (1.f - static_cast<float>(i - 1) / 6.f);
+        dl->AddRectFilledRounded({ winPos.x - grow, winPos.y - grow + 4.f },
+                                 { kW + grow * 2.f, kH + grow * 2.f },
+                                 kRadiusWindow + grow,
+                                 A(WithAlpha(ShadowTint, alpha)));
+        dl->CmdBuffer.back().clippingEnabled = false;
+    }
+
+    // 窗口外框描边
+    dl->AddRectRounded(winPos, { kW, kH }, kRadiusWindow, A(Border), 1.5f);
+    dl->CmdBuffer.back().clippingEnabled = false;
+}
+
+// 中央竖排文本
+void DrawCenteredText(Shadow::Vec2 pos, Shadow::Vec2 size, Shadow::Color color, std::string_view text) {
+    const Shadow::Vec2 ts = Shadow::MeasureTextSize(text);
+    Shadow::GetWindowDrawList()->AddText({ pos.x + (size.x - ts.x) * 0.5f,
+                                           pos.y + (size.y - ts.y) * 0.5f }, color, text);
+}
 
 // 页头拖动: 按住页头空白处移动窗口 (右侧按钮区除外)。
 void UpdateWindowDrag(const Shadow::Vec2& winPos) {
@@ -59,7 +114,7 @@ void UpdateWindowDrag(const Shadow::Vec2& winPos) {
     const bool overHeader = m.x >= winPos.x && m.x <= winPos.x + kW &&
                             m.y >= winPos.y && m.y <= winPos.y + kHeaderH;
     // 右侧按钮区 (UID/保存预设/配置) 不作为拖动热区
-    const float buttonsLeft = winPos.x + kW - 24.f - 120.f - 12.f - 96.f - 16.f - 230.f;
+    const float buttonsLeft = winPos.x + kW - kRightPad - kBtnGhostW - kBtnGap - kBtnPrimaryW - 210.f;
     const bool overButtons = m.x >= buttonsLeft &&
                              m.y >= winPos.y && m.y <= winPos.y + kHeaderH;
 
@@ -102,123 +157,185 @@ std::string PlayerUidText() {
     return cached;
 }
 
-// 侧边栏导航按钮; 返回是否被点击
-bool NavItem(std::string_view label, bool active, Shadow::Vec2 pos, float width, float height) {
-    auto& style = Shadow::GetStyle();
+// 侧边栏导航项。选中胶囊由 DrawSidebar 统一绘制 (这样它才能在两项之间滑动),
+// 这里只画悬停底色 + 圆点 + 文字; cover = 胶囊覆盖本项的程度 0..1,
+// 让文字在胶囊滑过时从深色平滑过渡到白色。
+bool NavItem(std::string_view label, bool active, float cover, Shadow::Vec2 pos, float width, float height) {
     auto* dl = Shadow::GetWindowDrawList();
-
     const bool hovered = Shadow::IsMouseHovering(pos, {width, height});
-    if (active || hovered) {
-        const Shadow::Color bg = active
-            ? style.Colors[Shadow::GuiCol_TabActive]
-            : style.Colors[Shadow::GuiCol_TabHovered];
-        dl->AddRectFilled(pos, {width, height}, bg); // Shadow: 第二参数是尺寸
-    }
-    if (active) { // 左侧高亮条
-        dl->AddRectFilled(pos, {3.f, height},
-                          style.Colors[Shadow::GuiCol_SliderGrab]);
-    }
 
-    const Shadow::Vec2 textSize = Shadow::MeasureTextSize(label);
-    dl->AddText({pos.x + (width - textSize.x) * 0.5f, pos.y + (height - textSize.y) * 0.5f},
-                active ? style.Colors[Shadow::GuiCol_TextHighlight] : style.Colors[Shadow::GuiCol_Text],
-                label);
+    if (!active && hovered)
+        dl->AddRectFilledRounded(pos, {width, height}, kRadiusInput, A(Rgb(0x2B2836)));
+
+    // 前导小圆点
+    dl->AddRectFilledRounded({ pos.x + 12.f, pos.y + (height - 6.f) * 0.5f }, { 6.f, 6.f }, 3.f,
+                             LerpColor(A(TextDim), A(Rgb(0xFFFFFF)), cover));
+
+    const Shadow::Vec2 ts = Shadow::MeasureTextSize(label);
+    dl->AddText({ pos.x + 28.f, pos.y + (height - ts.y) * 0.5f },
+                LerpColor(A(Text2), A(Rgb(0xFFFFFF)), cover), label);
 
     return hovered && Shadow::g_Ctx.MouseClicked; // 左键点击 (与库交互一致)
 }
 
 void DrawHeader(Shadow::Vec2 winPos) {
     auto* dl = Shadow::GetWindowDrawList();
-    auto& style = Shadow::GetStyle();
 
-    // 页头只覆盖侧栏右侧区域, 不再遮住侧栏顶部的 PALENGINE 标志
-    const Shadow::Vec2 hMin = {winPos.x + kSidebarW, winPos.y};
-    const Shadow::Vec2 hMax = {winPos.x + kW, winPos.y + kHeaderH};
-    dl->AddRectFilled(hMin, {hMax.x - hMin.x, kHeaderH}, style.Colors[Shadow::GuiCol_TitleBarBg]);
-    dl->AddRectFilled({hMin.x + 24.f, hMax.y - 1.f}, {hMax.x - hMin.x - 48.f, 1.f},
-                      Shadow::Color{0.008f, 0.55f, 0.98f, 0.25f});
+    const float left = winPos.x + kSidebarW + 18.f;
+    const float cy = winPos.y + kHeaderH * 0.5f;
 
-    // 页面标题
+    // 页面标题 (16px 主标题)
+    PushUiFont(kFontTitle);
     const Shadow::Vec2 titleSize = Shadow::MeasureTextSize(kTabs[g_menu.currentTab].label);
-    dl->AddText({hMin.x + 24.f, (kHeaderH - titleSize.y) * 0.5f},
-                style.Colors[Shadow::GuiCol_TextHighlight], kTabs[g_menu.currentTab].label);
+    dl->AddText({ left, cy - titleSize.y * 0.5f }, A(Text1), kTabs[g_menu.currentTab].label);
+    PopUiFont();
 
-    // 右侧: 保存预设 / 配置按钮 (绝对定位)
+    // 页头底部分隔线: 左段为 accent 渐变淡出 (EVICTED 的强调线), 右段为普通描边
+    {
+        const float sepY = winPos.y + kHeaderH - 1.f;
+        const float sepW = kW - kSidebarW;
+        const float glowW = sepW * 0.35f;
+        dl->AddRectFilledGradientRounded({ winPos.x + kSidebarW, sepY }, { glowW, 1.f }, 0.f,
+                                         A(Accent), A(WithAlpha(Accent, 0.f)), false);
+        dl->AddRectFilled({ winPos.x + kSidebarW + glowW, sepY }, { sepW - glowW, 1.f },
+                          A(WithAlpha(Border, 0.9f)));
+    }
+
+    // ---- 右侧控件: [UID 胶囊] [保存预设] [配置] ----
+    const float btnY = winPos.y + (kHeaderH - kBtnH) * 0.5f;
+    const float ghostX = winPos.x + kW - kRightPad - kBtnGhostW;
+    const float primaryX = ghostX - kBtnGap - kBtnPrimaryW;
+
     const std::string uid = PlayerUidText();
-    const float uidWidth = Shadow::MeasureTextSize(uid).x + 30.f;
-    const float uidX = hMax.x - 24.f - 120.f - 12.f - 96.f - 16.f - uidWidth;
-    dl->AddRectFilled({uidX, winPos.y + 14.f}, {uidWidth, 38.f},
-                      Shadow::Color{0.008f, 0.55f, 0.98f, 0.08f});
-    dl->AddRect({uidX, winPos.y + 14.f}, {uidWidth, 38.f},
-                Shadow::Color{0.008f, 0.55f, 0.98f, 0.35f});
-    dl->AddText({uidX + 15.f, winPos.y + 14.f + (38.f - Shadow::MeasureTextSize(uid).y) * 0.5f},
-                style.Colors[Shadow::GuiCol_TextDisabled], uid);
+    const float uidW = Shadow::MeasureTextSize(uid).x + 24.f;
+    const float uidX = primaryX - kBtnGap - uidW;
+    dl->AddRectFilledRounded({ uidX, btnY }, { uidW, kBtnH }, kRadiusInput, A(Surface));
+    dl->AddRectRounded({ uidX, btnY }, { uidW, kBtnH }, kRadiusInput, A(Border), 1.f);
+    DrawCenteredText({ uidX, btnY }, { uidW, kBtnH }, A(Text2), uid);
 
-    Shadow::g_Ctx.Cursor = {hMax.x - 24.f - 120.f - 12.f - 96.f, winPos.y + 13.f};
-    if (Shadow::Button("保存预设", {96.f, 34.f}))
+    // 主强调按钮
+    Shadow::g_Ctx.Cursor = { primaryX, btnY };
+    if (ButtonPrimaryAt({ primaryX, btnY }, { kBtnPrimaryW, kBtnH }, "保存预设"))
         Config::Save("config.json");
 
-    Shadow::g_Ctx.Cursor = {hMax.x - 24.f - 120.f, winPos.y + 13.f};
-    if (Shadow::Button("配置", {120.f, 34.f})) {
+    // 次级 (幽灵) 按钮
+    Shadow::g_Ctx.Cursor = { ghostX, btnY };
+    if (ButtonPrimaryAt({ ghostX, btnY }, { kBtnGhostW, kBtnH }, "配置", /*ghost=*/true)) {
         g_menu.currentTab = kSettingsTabIndex;
         g_menu.scroll = 0.f;
+        g_menu.contentFade = 0.f; // 内容区重新淡入
     }
-    Shadow::g_Ctx.Cursor = {hMin.x + kSidebarW + 20.f, hMax.y + 16.f};
+
+    Shadow::g_Ctx.Cursor = { left, winPos.y + kHeaderH + 16.f };
 }
 
 void DrawSidebar(Shadow::Vec2 winPos) {
     auto* dl = Shadow::GetWindowDrawList();
-    auto& style = Shadow::GetStyle();
 
-    // 边栏背景
-    dl->AddRectFilled(winPos, {kSidebarW, kH},
-                      style.Colors[Shadow::GuiCol_WindowBg]);
-    dl->AddRectFilled({winPos.x + kSidebarW - 1.f, winPos.y},
-                      {1.f, kH},
-                      Shadow::Color{0.008f, 0.55f, 0.98f, 0.15f});
+    const Shadow::Vec2 panelPos{ winPos.x + kWinPad, winPos.y + kWinPad };
+    const Shadow::Vec2 panelSize{ kSidebarW - kWinPad * 2.f, kH - kWinPad * 2.f };
 
-    // Logo
+    // 侧栏圆角面板 (bg-soft)
+    dl->AddRectFilledRounded(panelPos, panelSize, kRadiusCard, A(BgSoft));
+
+    const float panelCenterX = panelPos.x + panelSize.x * 0.5f;
+
+    // Logo + accent 渐变下划线 (EVICTED 风格的强调线: 两端淡出)
+    PushUiFont(kFontTitle);
     const Shadow::Vec2 logoSize = Shadow::MeasureTextSize("PALENGINE");
-    dl->AddText({winPos.x + (kSidebarW - logoSize.x) * 0.5f, winPos.y + 18.f},
-                style.Colors[Shadow::GuiCol_SliderGrab], "PALENGINE");
+    dl->AddText({ panelCenterX - logoSize.x * 0.5f, panelPos.y + 20.f }, A(Text1), "PALENGINE");
+    PopUiFont();
 
-    // 状态徽标
-    const Shadow::Vec2 verSize = Shadow::MeasureTextSize("v1.0 · Ready");
-    dl->AddText({winPos.x + (kSidebarW - verSize.x) * 0.5f, winPos.y + 44.f},
-                Shadow::Color{0.2f, 0.85f, 0.4f, 0.8f}, "v1.0 · Ready");
+    {
+        const float barW = std::min(logoSize.x, 130.f);
+        const float barX = panelCenterX - barW * 0.5f;
+        const float barY = panelPos.y + 41.f;
+        dl->AddRectFilledGradientRounded({ barX, barY }, { barW * 0.5f, 2.f }, 1.f,
+                                         A(WithAlpha(Accent, 0.f)), A(Accent), false);
+        dl->AddRectFilledGradientRounded({ barX + barW * 0.5f, barY }, { barW * 0.5f, 2.f }, 1.f,
+                                         A(Accent), A(WithAlpha(Accent, 0.f)), false);
+    }
+
+    // 版本 + 状态点
+    {
+        const std::string ver = "v1.0 · Ready";
+        const Shadow::Vec2 vs = Shadow::MeasureTextSize(ver);
+        const float dot = 6.f;
+        const float totalW = vs.x + dot + 6.f;
+        const float x = panelCenterX - totalW * 0.5f;
+        dl->AddRectFilledRounded({ x, panelPos.y + 50.f + (vs.y - dot) * 0.5f }, { dot, dot }, dot * 0.5f, A(Mint));
+        dl->AddText({ x + dot + 6.f, panelPos.y + 50.f }, A(Text2), ver);
+    }
 
     // 分隔线
-    dl->AddLine({winPos.x + 16.f, winPos.y + 78.f}, {winPos.x + kSidebarW - 16.f, winPos.y + 78.f},
-                style.Colors[Shadow::GuiCol_Separator], 1.f);
+    dl->AddRectFilled({ panelPos.x + 14.f, panelPos.y + 80.f }, { panelSize.x - 28.f, 1.f },
+                      A(WithAlpha(Border, 0.9f)));
 
-    // 导航项
-    constexpr float kNavTop = 94.f;
-    constexpr float kNavH = 40.f;
-    constexpr float kNavGap = 6.f;
+    // ---- 导航项 ----
+    const float itemX = panelPos.x + 8.f;
+    const float itemW = panelSize.x - 16.f;
+
+    // 选中胶囊的滑动动画: 位置指数趋近当前项 —— 打开菜单/切页都是"滑过去"而不是瞬移
+    const float dt = static_cast<float>(Shadow::GetIO().DeltaTime);
+    const float targetY = winPos.y + kNavTop + g_menu.currentTab * (kNavH + kNavGap);
+    if (g_menu.navIndicatorY < 0.f) g_menu.navIndicatorY = targetY;
+    g_menu.navIndicatorY += (targetY - g_menu.navIndicatorY) * EaseStep(dt, 0.075f);
+    if (std::abs(targetY - g_menu.navIndicatorY) < 0.4f) g_menu.navIndicatorY = targetY;
+
+    // 先画胶囊, 再画各项 (圆点/文字压在胶囊之上)。选中胶囊用蓝紫渐变 (EVICTED Tab)
+    dl->AddRectFilledGradientRounded({ itemX, g_menu.navIndicatorY }, { itemW, kNavH },
+                                     kRadiusInput, A(AccentBlue), A(AccentDeep), false);
+    // 选中项左侧强调竖条
+    dl->AddRectFilledRounded({ itemX + 2.f, g_menu.navIndicatorY + 9.f }, { 3.f, kNavH - 18.f },
+                             kRadiusPill, A(Accent));
+
     for (int i = 0; i < static_cast<int>(kTabs.size()); ++i) {
-        const Shadow::Vec2 itemPos{winPos.x + 14.f, winPos.y + kNavTop + i * (kNavH + kNavGap)};
-        if (NavItem(kTabs[i].label, g_menu.currentTab == i, itemPos, kSidebarW - 28.f, kNavH)) {
+        const float itemY = winPos.y + kNavTop + i * (kNavH + kNavGap);
+        // 胶囊覆盖本项的程度, 用于文字颜色交叉淡出
+        const float cover = std::clamp(1.f - std::abs(itemY - g_menu.navIndicatorY) / kNavH, 0.f, 1.f);
+        if (NavItem(kTabs[i].label, g_menu.currentTab == i, cover, { itemX, itemY }, itemW, kNavH)) {
             if (g_menu.currentTab != i) {
                 g_menu.currentTab = i;
                 g_menu.scroll = 0.f;
+                g_menu.contentFade = 0.f; // 内容区重新淡入
             }
         }
+    }
+
+    // 底部状态胶囊: 注入正常
+    {
+        const std::string status = "注入正常";
+        const Shadow::Vec2 ss = Shadow::MeasureTextSize(status);
+        const float pillW = ss.x + 40.f;
+        const float pillH = 28.f;
+        const Shadow::Vec2 pillPos{ panelCenterX - pillW * 0.5f,
+                                    panelPos.y + panelSize.y - pillH - 14.f };
+        dl->AddRectFilledRounded(pillPos, { pillW, pillH }, kRadiusPill, A(Surface));
+        dl->AddRectRounded(pillPos, { pillW, pillH }, kRadiusPill, A(Border), 1.f);
+        dl->AddRectFilledRounded({ pillPos.x + 14.f, pillPos.y + (pillH - 6.f) * 0.5f }, { 6.f, 6.f }, 3.f, A(Mint));
+        dl->AddText({ pillPos.x + 26.f, pillPos.y + (pillH - ss.y) * 0.5f }, A(Mint), status);
     }
 }
 
 void DrawContent(Shadow::Vec2 winPos) {
-    auto& style = Shadow::GetStyle();
     auto& ctx = Shadow::g_Ctx;
 
-    const Shadow::Vec2 contentMin{winPos.x + kSidebarW + 20.f, winPos.y + kHeaderH + 16.f};
-    const Shadow::Vec2 contentMax{winPos.x + kW - 24.f, winPos.y + kH - 20.f};
+    const Shadow::Vec2 contentMin{winPos.x + kSidebarW + 18.f, winPos.y + kHeaderH + 16.f};
+    const Shadow::Vec2 contentMax{winPos.x + kW - 22.f, winPos.y + kH - 18.f};
 
     // 滚动: 鼠标滚轮 (Shadow::Input 已累计到 MouseWheel, NewFrame 每帧清零)
     const float viewH = contentMax.y - contentMin.y;
     const float maxScroll = std::max(0.f, g_menu.contentHeight - viewH);
     g_menu.scroll = std::clamp(g_menu.scroll - ctx.MouseWheel * 40.f, 0.f, maxScroll);
 
+    // 内容淡入: 打开菜单 / 切页时从透明渐显, 避免内容"啪"地跳出来
+    g_menu.contentFade += (1.f - g_menu.contentFade) * EaseStep(static_cast<float>(Shadow::GetIO().DeltaTime), 0.05f);
+    if (g_menu.contentFade > 0.999f) g_menu.contentFade = 1.f;
+
     Shadow::PushClipRect(contentMin, contentMax);
+    // 只对内容区下调全局 Alpha (全局显隐淡入淡出在 FrameDriver 里已经压过一层)
+    Shadow::PushStyleVar(Shadow::GuiStyleVar_Alpha, Shadow::GetStyle().Alpha * g_menu.contentFade);
+
     SetRowArea(contentMin.x, contentMax.x - contentMin.x); // 行布局锚定到内容区
     ctx.Cursor = {contentMin.x, contentMin.y - g_menu.scroll};
 
@@ -226,6 +343,7 @@ void DrawContent(Shadow::Vec2 winPos) {
     kTabs[g_menu.currentTab].draw();
     g_menu.contentHeight = ctx.Cursor.y - startY; // 供下一帧滚动钳制
 
+    Shadow::PopStyleVar();
     Shadow::PopClipRect();
 }
 
@@ -238,13 +356,20 @@ void Initialize() {
 }
 
 void DrawMenu() {
+    // 每帧重申主题: 防止任何一方 (含库内部) 在帧中途改回默认配色
+    ApplyTheme();
+
     const Shadow::Vec2 screen = Shadow::GetIO().DisplaySize;
 
     // 菜单重新打开时丢弃上次会话遗留的弹窗状态 (关闭菜单那一刻下拉框可能还开着)
     static unsigned long long s_lastFrameTick = 0;
     const bool reopened = (GetTickCount64() - s_lastFrameTick > 1000);
     s_lastFrameTick = GetTickCount64();
-    if (reopened) Shadow::g_Ctx.ActivePopups.clear();
+    if (reopened) {
+        Shadow::g_Ctx.ActivePopups.clear();
+        g_menu.contentFade = 0.f;     // 每次打开菜单, 内容重新淡入
+        g_menu.navIndicatorY = -1.f;  // 胶囊直接就位, 不走"从上往下滑"的初始动画
+    }
 
     // 先应用拖动, 再取窗口位置 —— 避免拖动晚一帧才生效
     UpdateWindowDrag(g_menu.winPos);
@@ -255,6 +380,9 @@ void DrawMenu() {
     g_menu.winPos.x = std::clamp(g_menu.winPos.x, 0.f, std::max(0.f, screen.x - kW));
     g_menu.winPos.y = std::clamp(g_menu.winPos.y, 0.f, std::max(0.f, screen.y - kH));
     const Shadow::Vec2 winPos = g_menu.winPos;
+
+    // 投影画在窗口之前的背景层, 因此必须在 Begin 之前发射
+    DrawWindowShadow(winPos);
 
     Shadow::SetNextWindowPos(winPos);
     Shadow::SetNextWindowSize({kW, kH});

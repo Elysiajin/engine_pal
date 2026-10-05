@@ -57,7 +57,7 @@ void DrawWaypointRow(size_t index) {
     RowLabel(wp.waypointName);
 
     const float btnW = 64.f;
-    Shadow::g_Ctx.Cursor.x = RowRight() - btnW * 2 - Shadow::GetStyle().ItemSpacing.x - 12.f;
+    Shadow::g_Ctx.Cursor.x = RowRight() - btnW * 2 - Shadow::GetStyle().ItemSpacing.x;
 
     if (Shadow::Button(std::format("传送##{}", index), {btnW, 0.f}))
         TeleportPlayerTo(wp.waypointLocation);
@@ -155,13 +155,24 @@ void TabTeleporter() {
 
     constexpr int kColumns = 3;
     constexpr float kColumnGap = 8.f;
+    constexpr float kCellH = 30.f;
+    const float cellW = (RowWidth() - kColumnGap * (kColumns - 1)) / kColumns;
+
     int column = 0;
+    float cellBaseY = 0.f; // 本行卡片的按钮基准 Y
     for (const TeleporterPoint* point : points) {
-        if (column == 0) BeginRow(); // 每 3 个按钮共一行卡片 (上一版每项一行导致阶梯状错乱)
-        const float btnW = (RowWidth() - kColumnGap * (kColumns - 1)) / kColumns;
-        Shadow::g_Ctx.Cursor.x = RowLeft() + column * (btnW + kColumnGap);
-        if (Shadow::Button(point->name, {btnW, 30.f}))
+        if (column == 0) {
+            BeginRow();
+            // BeginRow 之后光标 Y 已是本行的内容起点; 记录它, 后面每一列都显式回到这里。
+            // 不能用 Shadow::SameLine() 回退: 它的回退量写死是 ItemHeight, 而这里按钮传了
+            // 显式高度 kCellH, 两者不等 → 每列都会往下漂, 排成阶梯。
+            cellBaseY = Shadow::g_Ctx.Cursor.y;
+        }
+        Shadow::g_Ctx.Cursor = { RowLeft() + column * (cellW + kColumnGap), cellBaseY };
+
+        if (Shadow::Button(point->name, {cellW, kCellH}))
             TeleportPlayerTo(SDK::FVector(point->x, point->y, point->z));
+
         if (++column == kColumns) {
             EndRow();
             column = 0;

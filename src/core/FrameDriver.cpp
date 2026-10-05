@@ -63,7 +63,8 @@ void UpdateGameCursor() {
 // 画一个小十字确保菜单永远可用。
 void DrawSoftwareCursor() {
     const Shadow::Vec2 m = Shadow::g_Ctx.MousePos;
-    const Shadow::Color c{1.f, 1.f, 1.f, 0.9f};
+    // 走 GetColor 才能吃到菜单淡入淡出的全局 Alpha, 否则光标会比菜单先出现
+    const Shadow::Color c = Shadow::GetColor(Shadow::Color{1.f, 1.f, 1.f, 0.9f});
     Shadow::GetBackgroundDrawList()->AddLine({m.x - 7.f, m.y}, {m.x + 7.f, m.y}, c, 1.4f);
     Shadow::GetBackgroundDrawList()->AddLine({m.x, m.y - 7.f}, {m.x, m.y + 7.f}, c, 1.4f);
     Shadow::GetBackgroundDrawList()->AddCircleFilled(m, 2.0f, c);
@@ -219,10 +220,13 @@ void FrameDriver::EnsureInitialized() {
 bool FrameDriver::IsInitialized() { return s_initialized; }
 
 void FrameDriver::UpdateFade(float dt) {
-    constexpr float kFadeSpeed = 8.0f;
+    // 指数趋近 (帧率无关), 淡入略慢于淡出。
+    // 这个 alpha 会经 GetColor 乘到整个菜单上: 窗口底、卡片、阴影、文字一起渐变。
+    // 上一版是线性推进 (8/s), 100ms 量级太生硬, 看着像"啪"地跳出来。
     const float target = input::IsMenuOpen() ? 1.0f : 0.0f;
-    if (s_alpha < target) s_alpha = std::min(target, s_alpha + kFadeSpeed * dt);
-    else                  s_alpha = std::max(target, s_alpha - kFadeSpeed * dt);
+    const float tau = (target > s_alpha) ? 0.075f : 0.05f;
+    s_alpha += (target - s_alpha) * (1.f - std::exp(-std::max(0.0001f, dt) / tau));
+    if (std::abs(target - s_alpha) < 0.002f) s_alpha = target;
 }
 
 float FrameDriver::MenuAlpha() { return s_alpha; }

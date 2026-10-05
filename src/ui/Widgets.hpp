@@ -22,8 +22,12 @@ void Slider(std::string_view label, float* value, float minVal, float maxVal, fl
 bool SliderInt(std::string_view label, int* value, int minVal, int maxVal); // 返回是否变更
 bool Combo(std::string_view label, int* currentIndex, const std::vector<std::string>& items);
 void ColorPicker(std::string_view label, float rgba[4]);       // Shadow::Color 布局兼容
-bool Button(std::string_view label);                           // 按内容自适应宽度
+bool Button(std::string_view label);                           // 按内容自适应宽度 (浅粉底 + 描边)
 bool ButtonFull(std::string_view label);                       // 占满整行
+bool ButtonPrimary(std::string_view label);                    // 主强调按钮 (粉→紫渐变), 自适应宽度
+bool ButtonPrimaryFull(std::string_view label);                // 主强调按钮, 占满整行
+// 无卡片行的按钮, 供顶部栏等自定义布局使用; ghost=true 时画成白底描边的次级按钮
+bool ButtonPrimaryAt(Shadow::Vec2 pos, Shadow::Vec2 size, std::string_view label, bool ghost = false);
 void HotKey(std::string_view label, int* hotkey);
 bool InputText(std::string_view label, std::string& text);
 bool InputFloat(std::string_view label, float* value);

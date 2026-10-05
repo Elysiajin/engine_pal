@@ -32,7 +32,8 @@ namespace fo = pal::features::objects;
 // ---------------------------------------------------------------------------
 class RightButtons {
 public:
-    explicit RightButtons(float rightPadding = 12.f) : x_(RowRight() - rightPadding) {}
+    // 内容区已经内缩过 (卡片内边距), 这里不再额外留白, 才能和其他行的控件右缘对齐
+    explicit RightButtons(float rightPadding = 0.f) : x_(RowRight() - rightPadding) {}
 
     bool Add(std::string_view label, std::string_view id, float width = 62.f) {
         if (!first_) Shadow::SameLine();
@@ -58,7 +59,7 @@ bool ListRow(std::string_view label, std::string_view id, bool selected) {
     RowLabel(selected ? std::format("▶ {}", label) : std::string(label));
 
     constexpr float kButtonW = 66.f;
-    Shadow::g_Ctx.Cursor.x = RowRight() - kButtonW - 12.f;
+    Shadow::g_Ctx.Cursor.x = RowRight() - kButtonW;
     const bool clicked = Shadow::Button(
         std::format("{}##{}", selected ? "已选" : "选择", id), {kButtonW, 0.f});
     EndRow();
